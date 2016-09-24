@@ -29,7 +29,7 @@
 
 @end
 
-@interface MTHttpWorker : AFHTTPClient
+@interface MTHttpWorker : AFHTTPSessionManager
 
 @property (nonatomic, strong, readonly) id internalId;
 @property (nonatomic, weak) id<MTHttpWorkerDelegate> delegate;

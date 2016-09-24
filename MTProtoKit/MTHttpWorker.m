@@ -42,7 +42,7 @@ MTInternalIdClass(MTHttpWorker)
 @interface MTHttpWorker ()
 {
     MTTimer *_timeoutTimer;
-    AFHTTPRequestOperation *_operation;
+    NSURLSessionTask *_operation;
     bool _notifiedDelegateAboutConnection;
     bool _isConnected;
     bool _stopped;
@@ -58,9 +58,9 @@ MTInternalIdClass(MTHttpWorker)
     static MTQueue *queue = nil;
     static dispatch_once_t onceToken;
     dispatch_once(&onceToken, ^
-    {
-        queue = [[MTQueue alloc] initWithName:"org.mtproto.httpWorkerProcessingQueue"];
-    });
+                  {
+                      queue = [[MTQueue alloc] initWithName:"org.mtproto.httpWorkerProcessingQueue"];
+                  });
     return queue;
 }
 
@@ -69,11 +69,11 @@ MTInternalIdClass(MTHttpWorker)
     int32_t randomId = 0;
     arc4random_buf(&randomId, 4);
     
-/*#ifdef DEBUG
-    if (![address isIpv6]) {
-        address = [[MTDatacenterAddress alloc] initWithIp:@"127.0.0.1" port:443 preferForMedia:address.preferForMedia restrictToTcp:address.restrictToTcp];
-    }
-#endif*/
+    /*#ifdef DEBUG
+     if (![address isIpv6]) {
+     address = [[MTDatacenterAddress alloc] initWithIp:@"127.0.0.1" port:443 preferForMedia:address.preferForMedia restrictToTcp:address.restrictToTcp];
+     }
+     #endif*/
     
     NSString *urlString = [[NSString alloc] initWithFormat:@"http://%@:%d/api%" PRIx32 "", address.ip, (int)address.port, randomId];
     
@@ -85,54 +85,32 @@ MTInternalIdClass(MTHttpWorker)
         _performsLongPolling = performsLongPolling;
         
         [[MTHttpWorker httpWorkerProcessingQueue] dispatchOnQueue:^
-        {
-            __weak MTHttpWorker *weakSelf = self;
-            
-            _timeout = performsLongPolling ? 40 : 12;
-            _timeoutTimer = [[MTTimer alloc] initWithTimeout:_timeout repeat:false completion:^
-            {
-                MTHttpWorker *strongSelf = weakSelf;
-                [strongSelf requestTimeout];
-            } queue:[MTHttpWorker httpWorkerProcessingQueue].nativeQueue];
-            [_timeoutTimer start];
-            
-            NSMutableURLRequest *urlRequest = [self requestWithMethod:@"POST" path:urlString parameters:nil];
-            [urlRequest setHTTPBody:payloadData];
-            
-            _operation = [[AFHTTPRequestOperation alloc] initWithRequest:urlRequest];
-            
-            [_operation setSuccessCallbackQueue:[MTHttpWorker httpWorkerProcessingQueue].nativeQueue];
-            [_operation setFailureCallbackQueue:[MTHttpWorker httpWorkerProcessingQueue].nativeQueue];
-            
-            [_operation setCompletionBlockWithSuccess:^(AFHTTPRequestOperation *operation, __unused id responseObject)
-            {
-                MTHttpWorker *strongSelf = weakSelf;
-                [strongSelf requestCompleted:[operation responseData] error:nil];
-            } failure:^(__unused AFHTTPRequestOperation *operation, NSError *error)
-            {
-                MTHttpWorker *strongSelf = weakSelf;
-                [strongSelf requestCompleted:nil error:error];
-            }];
-            
-            [_operation setUploadProgressBlock:^(__unused NSInteger bytesWritten, __unused NSInteger totalBytesWritten, __unused NSInteger totalBytesExpectedToWrite)
-            {
-                MTHttpWorker *strongSelf = weakSelf;
-                [strongSelf requestUploadProgress];
-            }];
-            
-            /*if (request.progressBlock != nil)
-            {
-                [httpOperation setDownloadProgressBlock:^(__unused NSInteger bytesRead, NSInteger totalBytesRead, NSInteger totalBytesExpectedToRead)
-                {
-                    if (totalBytesExpectedToRead > 0 && totalBytesRead > 0)
-                    {
-                        request.progressBlock(((float)totalBytesRead) / ((float)totalBytesExpectedToRead));
-                    }
-                }];
-            }*/
-            
-            [self enqueueHTTPRequestOperation:_operation];
-        }];
+         {
+             __weak MTHttpWorker *weakSelf = self;
+             
+             _timeout = performsLongPolling ? 40 : 12;
+             _timeoutTimer = [[MTTimer alloc] initWithTimeout:_timeout repeat:false completion:^
+                              {
+                                  MTHttpWorker *strongSelf = weakSelf;
+                                  [strongSelf requestTimeout];
+                              } queue:[MTHttpWorker httpWorkerProcessingQueue].nativeQueue];
+             [_timeoutTimer start];
+             
+             NSMutableURLRequest *urlRequest = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:urlString]];
+             [urlRequest setHTTPMethod:@"POST"];
+             [urlRequest setHTTPBody:payloadData];
+             
+             _operation = [self.session dataTaskWithRequest:urlRequest completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+                 if(error == nil) {
+                     MTHttpWorker *strongSelf = weakSelf;
+                     [strongSelf requestCompleted:data error:nil];
+                 } else {
+                     MTHttpWorker *strongSelf = weakSelf;
+                     [strongSelf requestCompleted:nil error:error];
+                 }
+             }];
+             [_operation resume];
+         }];
     }
     return self;
 }
@@ -151,13 +129,13 @@ MTInternalIdClass(MTHttpWorker)
 {
     _stopped = true;
     
-    AFHTTPRequestOperation *operation = _operation;
+    NSURLSessionTask *operation = _operation;
     _operation = nil;
-
+    
     [[MTHttpWorker httpWorkerProcessingQueue] dispatchOnQueue:^
-    {
-        [operation cancel];
-    }];
+     {
+         [operation cancel];
+     }];
     
     [self cancelTimer];
 }
@@ -165,13 +143,13 @@ MTInternalIdClass(MTHttpWorker)
 - (void)terminateWithFailure
 {
     [[MTHttpWorker httpWorkerProcessingQueue] dispatchOnQueue:^
-    {
-        [self stop];
-        
-        id<MTHttpWorkerDelegate> delegate = _delegate;
-        if ([delegate respondsToSelector:@selector(httpWorkerFailed:)])
-            [delegate httpWorkerFailed:self];
-    }];
+     {
+         [self stop];
+         
+         id<MTHttpWorkerDelegate> delegate = _delegate;
+         if ([delegate respondsToSelector:@selector(httpWorkerFailed:)])
+             [delegate httpWorkerFailed:self];
+     }];
 }
 
 - (void)cancelTimer
@@ -182,29 +160,29 @@ MTInternalIdClass(MTHttpWorker)
         _timeoutTimer = nil;
         
         [[MTHttpWorker httpWorkerProcessingQueue] dispatchOnQueue:^
-        {
-            [timeoutTimer invalidate];
-        }];
+         {
+             [timeoutTimer invalidate];
+         }];
     }
 }
 
 - (void)requestUploadProgress
 {
     [[MTHttpWorker httpWorkerProcessingQueue] dispatchOnQueue:^
-    {
-        _isConnected = true;
-        
-        if (!_notifiedDelegateAboutConnection)
-        {
-            _notifiedDelegateAboutConnection = true;
-            
-            id<MTHttpWorkerDelegate> delegate = _delegate;
-            if ([delegate respondsToSelector:@selector(httpWorkerConnected:)])
-                [delegate httpWorkerConnected:self];
-        }
-        
-        [_timeoutTimer resetTimeout:_timeout];
-    }];
+     {
+         _isConnected = true;
+         
+         if (!_notifiedDelegateAboutConnection)
+         {
+             _notifiedDelegateAboutConnection = true;
+             
+             id<MTHttpWorkerDelegate> delegate = _delegate;
+             if ([delegate respondsToSelector:@selector(httpWorkerConnected:)])
+                 [delegate httpWorkerConnected:self];
+         }
+         
+         [_timeoutTimer resetTimeout:_timeout];
+     }];
 }
 
 - (void)requestCompleted:(NSData *)response error:(NSError *)error
@@ -214,7 +192,7 @@ MTInternalIdClass(MTHttpWorker)
         id<MTHttpWorkerDelegate> delegate = _delegate;
         
         if (error == nil && response != nil)
-        {   
+        {
             if ([delegate respondsToSelector:@selector(httpWorker:completedWithData:)])
                 [delegate httpWorker:self completedWithData:response];
         }

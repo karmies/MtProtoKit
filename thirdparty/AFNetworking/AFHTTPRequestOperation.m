@@ -1,17 +1,16 @@
-// AFHTTPOperation.m
+// AFHTTPRequestOperation.m
+// Copyright (c) 2011–2015 Alamofire Software Foundation (http://alamofire.org/)
 //
-// Copyright (c) 2011 Gowalla (http://gowalla.com/)
-// 
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
 // in the Software without restriction, including without limitation the rights
 // to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
 // copies of the Software, and to permit persons to whom the Software is
 // furnished to do so, subject to the following conditions:
-// 
+//
 // The above copyright notice and this permission notice shall be included in
 // all copies or substantial portions of the Software.
-// 
+//
 // THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
 // IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
 // FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
@@ -22,229 +21,186 @@
 
 #import "AFHTTPRequestOperation.h"
 
-static NSString * AFStringFromIndexSet(NSIndexSet *indexSet) {
-    NSMutableString *string = [NSMutableString string];
+static dispatch_queue_t http_request_operation_processing_queue() {
+    static dispatch_queue_t af_http_request_operation_processing_queue;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        af_http_request_operation_processing_queue = dispatch_queue_create("com.alamofire.networking.http-request.processing", DISPATCH_QUEUE_CONCURRENT);
+    });
 
-    NSRange range = NSMakeRange([indexSet firstIndex], 1);
-    while (range.location != NSNotFound) {
-        NSUInteger nextIndex = [indexSet indexGreaterThanIndex:range.location];
-        while (nextIndex == range.location + range.length) {
-            range.length++;
-            nextIndex = [indexSet indexGreaterThanIndex:nextIndex];
-        }
+    return af_http_request_operation_processing_queue;
+}
 
-        if (string.length) {
-            [string appendString:@","];
-        }
+static dispatch_group_t http_request_operation_completion_group() {
+    static dispatch_group_t af_http_request_operation_completion_group;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        af_http_request_operation_completion_group = dispatch_group_create();
+    });
 
-        if (range.length == 1) {
-            [string appendFormat:@"%lu", (unsigned long)range.location];
-        } else {
-            NSUInteger firstIndex = range.location;
-            NSUInteger lastIndex = firstIndex + range.length - 1;
-            [string appendFormat:@"%lu-%lu", (unsigned long)firstIndex, (unsigned long)lastIndex];
-        }
-
-        range.location = nextIndex;
-        range.length = 1;
-    }
-
-    return string;
+    return af_http_request_operation_completion_group;
 }
 
 #pragma mark -
 
+@interface AFURLConnectionOperation ()
+@property (readwrite, nonatomic, strong) NSURLRequest *request;
+@property (readwrite, nonatomic, strong) NSURLResponse *response;
+@end
+
 @interface AFHTTPRequestOperation ()
-@property (readwrite, nonatomic, retain) NSError *HTTPError;
-@property (nonatomic) dispatch_once_t onceToken;
-@property (atomic) dispatch_semaphore_t dispatchSemaphore;
+@property (readwrite, nonatomic, strong) NSHTTPURLResponse *response;
+@property (readwrite, nonatomic, strong) id responseObject;
+@property (readwrite, nonatomic, strong) NSError *responseSerializationError;
+@property (readwrite, nonatomic, strong) NSRecursiveLock *lock;
 @end
 
 @implementation AFHTTPRequestOperation
-@synthesize acceptableStatusCodes = _acceptableStatusCodes;
-@synthesize acceptableContentTypes = _acceptableContentTypes;
-@synthesize HTTPError = _HTTPError;
-@synthesize successCallbackQueue = _successCallbackQueue;
-@synthesize failureCallbackQueue = _failureCallbackQueue;
-@synthesize dispatchGroup = _dispatchGroup;
-@synthesize onceToken = _onceToken;
-@synthesize dispatchSemaphore = _dispatchSemaphore;
+@dynamic response;
+@dynamic lock;
 
-
-- (id)initWithRequest:(NSURLRequest *)request {
-    self = [super initWithRequest:request];
+- (instancetype)initWithRequest:(NSURLRequest *)urlRequest {
+    self = [super initWithRequest:urlRequest];
     if (!self) {
         return nil;
     }
-    
-    self.acceptableStatusCodes = [NSIndexSet indexSetWithIndexesInRange:NSMakeRange(200, 100)];
-    self.dispatchSemaphore = dispatch_semaphore_create(1);
-    self.completionBlock = NULL;
-    
+
+    self.responseSerializer = [AFHTTPResponseSerializer serializer];
+
     return self;
 }
 
-- (void)dealloc {
-    [_acceptableStatusCodes release];
-    [_acceptableContentTypes release];
-    [_HTTPError release];
-    
-    if (_successCallbackQueue) { 
-        dispatch_release(_successCallbackQueue);
-        _successCallbackQueue = NULL;
-    }
-    
-    if (_failureCallbackQueue) { 
-        dispatch_release(_failureCallbackQueue); 
-        _failureCallbackQueue = NULL;
-    }
-    
-    if (_dispatchGroup) {
-        dispatch_release(_dispatchGroup);
-        _dispatchGroup = NULL;
-    }
-    
-    if (_dispatchSemaphore) {
-        dispatch_release(_dispatchSemaphore);
-        _dispatchSemaphore = NULL;
-    }
-    
-    [super dealloc];
+- (void)setResponseSerializer:(AFHTTPResponseSerializer <AFURLResponseSerialization> *)responseSerializer {
+    NSParameterAssert(responseSerializer);
+
+    [self.lock lock];
+    _responseSerializer = responseSerializer;
+    self.responseObject = nil;
+    self.responseSerializationError = nil;
+    [self.lock unlock];
 }
 
-- (NSHTTPURLResponse *)response {
-    return (NSHTTPURLResponse *)[super response];
+- (id)responseObject {
+    [self.lock lock];
+    if (!_responseObject && [self isFinished] && !self.error) {
+        NSError *error = nil;
+        self.responseObject = [self.responseSerializer responseObjectForResponse:self.response data:self.responseData error:&error];
+        if (error) {
+            self.responseSerializationError = error;
+        }
+    }
+    [self.lock unlock];
+
+    return _responseObject;
 }
 
 - (NSError *)error {
-    if (self.response && !self.HTTPError) {
-        if (![self hasAcceptableStatusCode]) {
-            NSMutableDictionary *userInfo = [NSMutableDictionary dictionary];
-            [userInfo setValue:[NSString stringWithFormat:NSLocalizedString(@"Expected status code in (%@), got %d", nil), AFStringFromIndexSet(self.acceptableStatusCodes), [self.response statusCode]] forKey:NSLocalizedDescriptionKey];
-            [userInfo setValue:[self.request URL] forKey:NSURLErrorFailingURLErrorKey];
-            
-            self.HTTPError = [[[NSError alloc] initWithDomain:AFNetworkingErrorDomain code:NSURLErrorBadServerResponse userInfo:userInfo] autorelease];
-        } else if ([self.responseData length] > 0 && ![self hasAcceptableContentType]) { // Don't invalidate content type if there is no content
-            NSMutableDictionary *userInfo = [NSMutableDictionary dictionary];
-            [userInfo setValue:[NSString stringWithFormat:NSLocalizedString(@"Expected content type %@, got %@", nil), self.acceptableContentTypes, [self.response MIMEType]] forKey:NSLocalizedDescriptionKey];
-            [userInfo setValue:[self.request URL] forKey:NSURLErrorFailingURLErrorKey];
-            
-            self.HTTPError = [[[NSError alloc] initWithDomain:AFNetworkingErrorDomain code:NSURLErrorCannotDecodeContentData userInfo:userInfo] autorelease];
-        }
-    }
-    
-    if (self.HTTPError) {
-        return self.HTTPError;
+    if (_responseSerializationError) {
+        return _responseSerializationError;
     } else {
         return [super error];
     }
 }
 
-- (BOOL)hasAcceptableStatusCode {
-    return !self.acceptableStatusCodes || [self.acceptableStatusCodes containsIndex:[self.response statusCode]];
-}
-
-- (BOOL)hasAcceptableContentType {
-    return !self.acceptableContentTypes || [self.acceptableContentTypes containsObject:[self.response MIMEType]];
-}
-
-- (void)setSuccessCallbackQueue:(dispatch_queue_t)successCallbackQueue {
-    if (successCallbackQueue != _successCallbackQueue) {
-        if (_successCallbackQueue) {
-            dispatch_release(_successCallbackQueue);
-        }
-     
-        if (successCallbackQueue) {
-            dispatch_retain(successCallbackQueue);
-            _successCallbackQueue = successCallbackQueue;
-        }
-    }    
-}
-
-- (void)setFailureCallbackQueue:(dispatch_queue_t)failureCallbackQueue {
-    if (failureCallbackQueue != _failureCallbackQueue) {
-        if (_failureCallbackQueue) {
-            dispatch_release(_failureCallbackQueue);
-        }
-        
-        if (failureCallbackQueue) {
-            dispatch_retain(failureCallbackQueue);
-            _failureCallbackQueue = failureCallbackQueue;
-        }
-    }    
-}
-
-- (void)setDispatchGroup:(dispatch_group_t)dispatchGroup {
-    dispatch_semaphore_wait(self.dispatchSemaphore, DISPATCH_TIME_FOREVER);
-    if (dispatchGroup != _dispatchGroup) {
-        if (_dispatchGroup) {
-            dispatch_group_leave(_dispatchGroup);
-            dispatch_release(_dispatchGroup);
-            _dispatchGroup = NULL;
-        }
-        
-        if (dispatchGroup) {
-            dispatch_retain(dispatchGroup);
-            _dispatchGroup = dispatchGroup;
-            dispatch_group_enter(_dispatchGroup);
-        }
-    } 
-    dispatch_semaphore_signal(self.dispatchSemaphore);
-}
-
-- (dispatch_group_t)dispatchGroup {
-    dispatch_semaphore_wait(self.dispatchSemaphore, DISPATCH_TIME_FOREVER);
-    if(_dispatchGroup == NULL) {
-        _dispatchGroup = dispatch_group_create();
-        dispatch_group_enter(_dispatchGroup);
-    }
-    dispatch_semaphore_signal(self.dispatchSemaphore);
-    return _dispatchGroup;
-}
-
-- (void)setCompletionBlock:(void (^)(void))block {
-     __block id _blockSelf = self;
-    dispatch_once_t *blockOnceToken = &_onceToken;
-    
-    [super setCompletionBlock:^{
-        if(block) {
-            block();
-        }
-        // Dispatch once is used to ensure that setting the block with this block will not cause multiple calls to 'dispatch_group_leave'
-        dispatch_once(blockOnceToken, ^{
-            dispatch_group_leave([_blockSelf dispatchGroup]);
-        });
-    }];
-}
+#pragma mark - AFHTTPRequestOperation
 
 - (void)setCompletionBlockWithSuccess:(void (^)(AFHTTPRequestOperation *operation, id responseObject))success
                               failure:(void (^)(AFHTTPRequestOperation *operation, NSError *error))failure
 {
-    self.completionBlock = ^ {
-        if ([self isCancelled]) {
-            return;
+    // completionBlock is manually nilled out in AFURLConnectionOperation to break the retain cycle.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Warc-retain-cycles"
+#pragma clang diagnostic ignored "-Wgnu"
+    self.completionBlock = ^{
+        if (self.completionGroup) {
+            dispatch_group_enter(self.completionGroup);
         }
-        
-        if (self.error) {
-            if (failure) {
-                dispatch_group_async(self.dispatchGroup, self.failureCallbackQueue ? self.failureCallbackQueue : dispatch_get_main_queue(), ^{
-                    failure(self, self.error);
-                });
+
+        dispatch_async(http_request_operation_processing_queue(), ^{
+            if (self.error) {
+                if (failure) {
+                    dispatch_group_async(self.completionGroup ?: http_request_operation_completion_group(), self.completionQueue ?: dispatch_get_main_queue(), ^{
+                        failure(self, self.error);
+                    });
+                }
+            } else {
+                id responseObject = self.responseObject;
+                if (self.error) {
+                    if (failure) {
+                        dispatch_group_async(self.completionGroup ?: http_request_operation_completion_group(), self.completionQueue ?: dispatch_get_main_queue(), ^{
+                            failure(self, self.error);
+                        });
+                    }
+                } else {
+                    if (success) {
+                        dispatch_group_async(self.completionGroup ?: http_request_operation_completion_group(), self.completionQueue ?: dispatch_get_main_queue(), ^{
+                            success(self, responseObject);
+                        });
+                    }
+                }
             }
-        } else {
-            if (success) {
-                dispatch_group_async(self.dispatchGroup, self.successCallbackQueue ? self.successCallbackQueue : dispatch_get_main_queue(), ^{
-                    success(self, self.responseData);
-                });
+
+            if (self.completionGroup) {
+                dispatch_group_leave(self.completionGroup);
             }
-        }
+        });
     };
+#pragma clang diagnostic pop
 }
 
-#pragma mark - AFHTTPClientOperation
+#pragma mark - AFURLRequestOperation
 
-+ (BOOL)canProcessRequest:(NSURLRequest *)__unused request {
+- (void)pause {
+    [super pause];
+
+    u_int64_t offset = 0;
+    if ([self.outputStream propertyForKey:NSStreamFileCurrentOffsetKey]) {
+        offset = [(NSNumber *)[self.outputStream propertyForKey:NSStreamFileCurrentOffsetKey] unsignedLongLongValue];
+    } else {
+        offset = [(NSData *)[self.outputStream propertyForKey:NSStreamDataWrittenToMemoryStreamKey] length];
+    }
+
+    NSMutableURLRequest *mutableURLRequest = [self.request mutableCopy];
+    if ([self.response respondsToSelector:@selector(allHeaderFields)] && [[self.response allHeaderFields] valueForKey:@"ETag"]) {
+        [mutableURLRequest setValue:[[self.response allHeaderFields] valueForKey:@"ETag"] forHTTPHeaderField:@"If-Range"];
+    }
+    [mutableURLRequest setValue:[NSString stringWithFormat:@"bytes=%llu-", offset] forHTTPHeaderField:@"Range"];
+    self.request = mutableURLRequest;
+}
+
+#pragma mark - NSSecureCoding
+
++ (BOOL)supportsSecureCoding {
     return YES;
+}
+
+- (id)initWithCoder:(NSCoder *)decoder {
+    self = [super initWithCoder:decoder];
+    if (!self) {
+        return nil;
+    }
+
+    self.responseSerializer = [decoder decodeObjectOfClass:[AFHTTPResponseSerializer class] forKey:NSStringFromSelector(@selector(responseSerializer))];
+
+    return self;
+}
+
+- (void)encodeWithCoder:(NSCoder *)coder {
+    [super encodeWithCoder:coder];
+
+    [coder encodeObject:self.responseSerializer forKey:NSStringFromSelector(@selector(responseSerializer))];
+}
+
+#pragma mark - NSCopying
+
+- (id)copyWithZone:(NSZone *)zone {
+    AFHTTPRequestOperation *operation = [super copyWithZone:zone];
+
+    operation.responseSerializer = [self.responseSerializer copyWithZone:zone];
+    operation.completionQueue = self.completionQueue;
+    operation.completionGroup = self.completionGroup;
+
+    return operation;
 }
 
 @end
