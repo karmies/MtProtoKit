@@ -1,14 +1,6 @@
-/*
- * This is the source code of Telegram for iOS v. 1.1
- * It is licensed under GNU GPL v. 2 or later.
- * You should have received a copy of the license in this archive (see LICENSE).
- *
- * Copyright Peter Iakovlev, 2013.
- */
-
 // AFNetworking.h
 //
-// Copyright (c) 2011 Gowalla (http://gowalla.com/)
+// Copyright (c) 2013 AFNetworking (http://afnetworking.com/)
 // 
 // Permission is hereby granted, free of charge, to any person obtaining a copy
 // of this software and associated documentation files (the "Software"), to deal
@@ -30,13 +22,20 @@
 
 #import <Foundation/Foundation.h>
 #import <Availability.h>
+#import <TargetConditionals.h>
 
 #ifndef _AFNETWORKING_
-#define _AFNETWORKING_
+    #define _AFNETWORKING_
 
-#import "AFURLConnectionOperation.h"
+    #import "AFURLRequestSerialization.h"
+    #import "AFURLResponseSerialization.h"
+    #import "AFSecurityPolicy.h"
 
-#import "AFHTTPRequestOperation.h"
-#import "AFHTTPClient.h"
+#if !TARGET_OS_WATCH
+    #import "AFNetworkReachabilityManager.h"
+#endif
+
+    #import "AFURLSessionManager.h"
+    #import "AFHTTPSessionManager.h"
 
 #endif /* _AFNETWORKING_ */
